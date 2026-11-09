@@ -1,0 +1,24 @@
+name: specinfo-ipa
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build IPA
+        run: |
+          brew install ldid
+          xcrun -sdk iphoneos clang -arch arm64 \
+            -miphoneos-version-min=14.0 -fobjc-arc \
+            -framework UIKit -framework Foundation \
+            main.m -o SpecInfo
+          mkdir -p Payload/SpecInfo.app
+          cp SpecInfo Info.plist Payload/SpecInfo.app/
+          ldid -S Payload/SpecInfo.app/SpecInfo
+          zip -r SpecInfo.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpecInfo-ipa
+          path: SpecInfo.ipa
