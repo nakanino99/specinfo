@@ -12,7 +12,7 @@ jobs:
           brew install ldid
           xcrun -sdk iphoneos clang -arch arm64 \
             -miphoneos-version-min=14.0 -fobjc-arc \
-            -framework UIKit -framework Foundation \
+            -framework UIKit -framework Foundation -framework CoreGraphics \
             main.m -o SpecInfo
           mkdir -p Payload/SpecInfo.app
           cp SpecInfo Info.plist Payload/SpecInfo.app/
