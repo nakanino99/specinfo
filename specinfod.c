@@ -33,11 +33,14 @@ int main(void) {
   while (now_s() - t0 < 1500) {
     double t = now_s();
     char buf[160] = {0}; size_t l = sizeof(buf) - 1;
-    unsigned seq = 0, frames = 0, late = 0;
-    unsigned long long ms = 0, gap = 0, pr = 0, af = 0;
+    unsigned seq = 0, frames = 0, late = 0, ticks = 0;
+    unsigned long long ms = 0, gap = 0, pr = 0, af = 0, tgap = 0;
+    int n = 0;
     int have = sysctlbyname("kern.sweet_fps", buf, &l, NULL, 0) == 0;
-    int ok = have && buf[0] != 0 &&
-        sscanf(buf, "%u %u %llu %llu %u %llu %llu", &seq, &frames, &ms, &gap, &late, &pr, &af) == 7;
+    if (have && buf[0] != 0) {
+      n = sscanf(buf, "%u %u %llu %llu %u %llu %llu %u %llu", &seq, &frames, &ms, &gap, &late, &pr, &af, &ticks, &tgap);
+    }
+    int ok = n >= 7;
     int fresh = ok && seq != last_seq;
     int domem = t - tmem >= 30;
     if (fresh || domem || (!have && !warned)) {
@@ -45,8 +48,12 @@ int main(void) {
       if (!f) f = fopen("/var/tmp/specinfo.txt", "a");
       if (f) {
         if (fresh) {
-          fprintf(f, "t=%.0fs fps seq=%u frames=%u ms=%llu gap=%llums late=%u present=%lluus after=%lluus\n",
+          fprintf(f, "t=%.0fs fps seq=%u frames=%u ms=%llu gap=%llums late=%u present=%lluus after=%lluus",
                   t - t0, seq, frames, ms, gap, late, pr, af);
+          if (n >= 9) {
+            fprintf(f, " ticks=%u tickgap=%llums", ticks, tgap);
+          }
+          fprintf(f, "\n");
           last_seq = seq;
         }
         if (!have && !warned) { fprintf(f, "kern.sweet_fps belum ada di kernel ini\n"); warned = 1; }
