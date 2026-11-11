@@ -33,12 +33,13 @@ int main(void) {
   while (now_s() - t0 < 1500) {
     double t = now_s();
     char buf[160] = {0}; size_t l = sizeof(buf) - 1;
-    unsigned seq = 0, frames = 0, late = 0, ticks = 0;
+    unsigned seq = 0, frames = 0, late = 0, ticks = 0, modes = 0, n79 = 0, s0 = 0, osz = 0, fl = 0;
     unsigned long long ms = 0, gap = 0, pr = 0, af = 0, tgap = 0;
     int n = 0;
     int have = sysctlbyname("kern.sweet_fps", buf, &l, NULL, 0) == 0;
     if (have && buf[0] != 0) {
-      n = sscanf(buf, "%u %u %llu %llu %u %llu %llu %u %llu", &seq, &frames, &ms, &gap, &late, &pr, &af, &ticks, &tgap);
+      n = sscanf(buf, "%u %u %llu %llu %u %llu %llu %u %llu %u %u %x %u %x",
+          &seq, &frames, &ms, &gap, &late, &pr, &af, &ticks, &tgap, &modes, &n79, &s0, &osz, &fl);
     }
     int ok = n >= 7;
     int fresh = ok && seq != last_seq;
@@ -52,6 +53,9 @@ int main(void) {
                   t - t0, seq, frames, ms, gap, late, pr, af);
           if (n >= 9) {
             fprintf(f, " ticks=%u tickgap=%llums", ticks, tgap);
+          }
+          if (n >= 14) {
+            fprintf(f, " modes=%u n79=%u s0=%#x osz=%u fl=%#x", modes, n79, s0, osz, fl);
           }
           fprintf(f, "\n");
           last_seq = seq;
