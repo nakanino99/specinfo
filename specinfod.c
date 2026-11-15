@@ -212,6 +212,7 @@ static void sym_load(void) {
   }
 }
 
+#define ZEFF(z) ((z).cur ? (z).cur : (z).count * (z).elem)
 static double MB(uint64_t x) { return x / 1048576.0; }
 
 static long sysint(const char *name, int *okp) {
@@ -407,34 +408,35 @@ static void zones(FILE *f) {
   static char pname[MAXZ][80]; static uint64_t pcur[MAXZ], fcur[MAXZ]; static int pn = 0;
   mach_msg_type_number_t n = nn < ni ? nn : ni; if (n > MAXZ) n = MAXZ;
   struct { int i; uint64_t cur; } o[MAXZ];
-  for (mach_msg_type_number_t i = 0; i < n; i++) { o[i].i = i; o[i].cur = zi[i].cur; }
+  for (mach_msg_type_number_t i = 0; i < n; i++) { o[i].i = i; o[i].cur = ZEFF(zi[i]); }
   for (mach_msg_type_number_t a = 0; a < n; a++)           /* urut turun, n kecil (±300) */
     for (mach_msg_type_number_t b = a + 1; b < n; b++)
       if (o[b].cur > o[a].cur) { int ti = o[a].i; uint64_t tc = o[a].cur; o[a] = o[b]; o[b].i = ti; o[b].cur = tc; }
-  uint64_t total = 0; for (mach_msg_type_number_t i = 0; i < n; i++) total += zi[i].cur;
+  uint64_t total = 0; for (mach_msg_type_number_t i = 0; i < n; i++) total += ZEFF(zi[i]);
   fprintf(f, "zone: %u zone, total %.0fMB (d=perubahan sejak sampel lalu, d0=sejak sampel pertama)\n", (unsigned)n, MB(total));
   for (int k = 0; k < 10 && k < (int)n; k++) {
     int i = o[k].i; double d = 0, d0 = 0;
-    if (pn == (int)n && !strncmp(pname[i], nm[i].name, 80)) { d = (double)zi[i].cur - (double)pcur[i]; d0 = (double)zi[i].cur - (double)fcur[i]; }
-    fprintf(f, "zone:   %-28.28s cur=%.1fMB count=%llu elem=%lluB d=%+.1fMB d0=%+.1fMB\n",
-            nm[i].name, MB(zi[i].cur), (unsigned long long)zi[i].count, (unsigned long long)zi[i].elem, d / 1048576.0, d0 / 1048576.0);
+    if (pn == (int)n && !strncmp(pname[i], nm[i].name, 80)) { d = (double)ZEFF(zi[i]) - (double)pcur[i]; d0 = (double)ZEFF(zi[i]) - (double)fcur[i]; }
+    fprintf(f, "zone:   %-28.28s size=%.1fMB (cur_raw=%.1fMB alloc=%.1fMB sum=%.1fMB) count=%llu elem=%lluB d=%+.1fMB d0=%+.1fMB\n",
+            nm[i].name, MB(ZEFF(zi[i])), MB(zi[i].cur), MB(zi[i].alloc), MB(zi[i].sum),
+            (unsigned long long)zi[i].count, (unsigned long long)zi[i].elem, d / 1048576.0, d0 / 1048576.0);
   }
   /* zone yang paling tumbuh sejak sampel pertama, walau bukan yang terbesar */
   if (pn == (int)n) {
     int bi = -1; double bd = 0;
     for (mach_msg_type_number_t i = 0; i < n; i++) {
       if (strncmp(pname[i], nm[i].name, 80)) continue;
-      double d0 = (double)zi[i].cur - (double)fcur[i];
+      double d0 = (double)ZEFF(zi[i]) - (double)fcur[i];
       if (d0 > bd) { bd = d0; bi = i; }
     }
-    if (bi >= 0 && bd > 1048576.0) fprintf(f, "zone: paling tumbuh sejak awal: %.80s +%.1fMB (cur=%.1fMB)\n", nm[bi].name, bd / 1048576.0, MB(zi[bi].cur));
+    if (bi >= 0 && bd > 1048576.0) fprintf(f, "zone: paling tumbuh sejak awal: %.80s +%.1fMB (size=%.1fMB)\n", nm[bi].name, bd / 1048576.0, MB(zi[bi].cur));
   }
   int first = (pn != (int)n);
   for (mach_msg_type_number_t i = 0; i < n; i++) {
     int same = !first && !strncmp(pname[i], nm[i].name, 80);
     strncpy(pname[i], nm[i].name, 79); pname[i][79] = 0;
-    pcur[i] = zi[i].cur;
-    if (!same) fcur[i] = zi[i].cur;
+    pcur[i] = ZEFF(zi[i]);
+    if (!same) fcur[i] = ZEFF(zi[i]);
   }
   pn = (int)n;
   vm_deallocate(mach_task_self(), (vm_address_t)nm, nn * sizeof(zname_t));
@@ -456,6 +458,30 @@ static int name_ok(const char *nm) {         /* 80 byte: karakter tercetak lalu 
   return i < 80;
 }
 
+static long det_first = -1;
+static int detect_stride(const unsigned char *b, size_t len) {   /* jarak antar nama kext "com.apple." */
+  int hist[80]; memset(hist, 0, sizeof(hist));
+  long last = -1; det_first = -1;
+  for (size_t i = 0; i + 10 < len; i++) {
+    if (memcmp(b + i, "com.apple.", 10) == 0) {
+      if (det_first < 0) det_first = (long)i;
+      if (last >= 0) { long d = (long)i - last; if (d % 8 == 0 && d >= 64 && d < 640) hist[d / 8]++; }
+      last = (long)i; i += 9;
+    }
+  }
+  int best = 0, bc = 0;
+  for (int k = 0; k < 80; k++) if (hist[k] > bc) { bc = hist[k]; best = k * 8; }
+  return bc >= 3 ? best : 0;
+}
+
+static void hexdump(FILE *f, const unsigned char *b, size_t n) {
+  for (size_t i = 0; i < n; i += 32) {
+    fprintf(f, "kmem: hex +%03zu:", i);
+    for (size_t j = i; j < i + 32 && j < n; j++) fprintf(f, " %02x", b[j]);
+    fprintf(f, "\n");
+  }
+}
+
 static void kmem(FILE *f) {
   if (!p_mmi) { fprintf(f, "kmem: simbol mach_memory_info HILANG di sistem ini\n"); return; }
   mach_port_t hp = get_hpriv();
@@ -467,10 +493,29 @@ static void kmem(FILE *f) {
   if (kr != KERN_SUCCESS || !mi || !nmi) { fprintf(f, "kmem: mach_memory_info gagal kr=%d n=%u\n", kr, (unsigned)nmi); goto out; }
 
   {
-    unsigned chk = nmi < 8 ? nmi : 8; int good = 0, named = 0;
-    kmi176_t *e = (kmi176_t *)mi;
-    for (unsigned i = 0; i < chk; i++) if (name_ok(e[i].name)) { good++; if (e[i].name[0]) named++; }
-    if (chk && good >= (int)chk - 1 && named >= 1) stride = 176;
+    int det = detect_stride((const unsigned char *)mi, (size_t)nmi * 64);   /* aman: array minimal nmi*64 byte */
+    if (det == 176) stride = 176;
+    else if (det > 0) {
+      stride = det;
+      fprintf(f, "kmem: stride terdeteksi %d byte, bukan 176/64; struct tidak dikenal, tidak di-parse. entri=%u\n", det, (unsigned)nmi);
+      { size_t e0 = det_first >= 0 ? ((size_t)det_first / det) * det : 0;      /* mulai di entri kext pertama */
+        size_t total = (size_t)nmi * det, n2 = (size_t)det * 2;
+        if (e0 + n2 > total) n2 = total > e0 ? total - e0 : 0;
+        if (n2 > 512) n2 = 512;
+        fprintf(f, "kmem: hex mulai entri #%zu (offset %zu)\n", e0 / det, e0);
+        hexdump(f, (const unsigned char *)mi + e0, n2); }
+      goto out;
+    } else {
+      /* tanpa nama kext: cek 176 hanya pada entri yang pasti ada di array 64-byte */
+      unsigned lim = (unsigned)(((size_t)nmi * 64) / 176); int bad = 0, named = 0;
+      kmi176_t *e = (kmi176_t *)mi;
+      for (unsigned i = 0; i < lim; i++) { if (!name_ok(e[i].name)) bad++; else if (e[i].name[0]) named++; }
+      if (lim >= 8 && !bad && named >= 1) stride = 176;
+      else {
+        fprintf(f, "kmem: stride tidak bisa dipastikan (pakai 64). hex entri awal:\n");
+        hexdump(f, (const unsigned char *)mi, 192);
+      }
+    }
   }
 
   enum { MAXK = 1024 };
