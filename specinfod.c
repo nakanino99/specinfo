@@ -186,6 +186,8 @@ static int (*p_pname)(int, void *, uint32_t);
 static kern_return_t (*p_tfp)(mach_port_t, int, mach_port_t *);
 static kern_return_t (*p_hpriv)(mach_port_t, mach_port_t *);
 static kern_return_t (*p_zi)(mach_port_t, zname_t **, mach_msg_type_number_t *, zinfo_t **, mach_msg_type_number_t *);
+static kern_return_t (*p_hsp)(mach_port_t, int, int, mach_port_t *);   /* host_get_special_port */
+static kern_return_t (*p_mmi)(mach_port_t, zname_t **, mach_msg_type_number_t *, zinfo_t **, mach_msg_type_number_t *, void **, mach_msg_type_number_t *);
 static int sym_ready = 0;
 
 static void sym_load(void) {
@@ -198,6 +200,16 @@ static void sym_load(void) {
   *(void **)&p_tfp = dlsym(h, "task_for_pid");
   *(void **)&p_hpriv = dlsym(h, "host_get_host_priv_port");
   *(void **)&p_zi = dlsym(h, "mach_zone_info");
+  *(void **)&p_hsp = dlsym(h, "host_get_special_port");
+  *(void **)&p_mmi = dlsym(h, "mach_memory_info");
+  void *k = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_NOW);
+  if (k) {
+    if (!p_tfp)   *(void **)&p_tfp = dlsym(k, "task_for_pid");
+    if (!p_hpriv) *(void **)&p_hpriv = dlsym(k, "host_get_host_priv_port");
+    if (!p_zi)    *(void **)&p_zi = dlsym(k, "mach_zone_info");
+    if (!p_hsp)   *(void **)&p_hsp = dlsym(k, "host_get_special_port");
+    if (!p_mmi)   *(void **)&p_mmi = dlsym(k, "mach_memory_info");
+  }
 }
 
 static double MB(uint64_t x) { return x / 1048576.0; }
@@ -294,6 +306,27 @@ static const struct { int tag; const char *nm; } tagnames[] = {
 #ifdef VM_MEMORY_ANALYTICS
   TG(ANALYTICS)
 #endif
+#ifdef VM_MEMORY_LAYERKIT
+  TG(LAYERKIT)
+#endif
+#ifdef VM_MEMORY_UNSHARED_PMAP
+  TG(UNSHARED_PMAP)
+#endif
+#ifdef VM_MEMORY_CGIMAGE
+  TG(CGIMAGE)
+#endif
+#ifdef VM_MEMORY_IMAGEIO
+  TG(IMAGEIO)
+#endif
+#ifdef VM_MEMORY_COREANIMATION
+  TG(COREANIMATION)
+#endif
+#ifdef VM_MEMORY_GLSL
+  TG(GLSL)
+#endif
+#ifdef VM_MEMORY_SHARED_PMAP
+  TG(SHARED_PMAP)
+#endif
   {-1, NULL}
 };
 
@@ -340,10 +373,33 @@ static void vmdetail(FILE *f, int pid, const char *name) {
   }
 }
 
+/* Port host_priv: coba host_get_host_priv_port, lalu host_get_special_port(HOST_PRIV_PORT=1) dengan node -1 dan 0. */
+static const char *hp_how = "belum dicoba";
+static mach_port_t get_hpriv(void) {
+  static mach_port_t cached = MACH_PORT_NULL;
+  if (cached != MACH_PORT_NULL) return cached;
+  mach_port_t hp = MACH_PORT_NULL; kern_return_t kr;
+  if (p_hpriv) {
+    kr = p_hpriv(mach_host_self(), &hp);
+    if (kr == KERN_SUCCESS && hp != MACH_PORT_NULL) { hp_how = "host_get_host_priv_port"; return cached = hp; }
+  }
+  if (p_hsp) {
+    int nodes[2] = {-1, 0};
+    for (int i = 0; i < 2; i++) {
+      hp = MACH_PORT_NULL;
+      kr = p_hsp(mach_host_self(), nodes[i], 1, &hp);
+      if (kr == KERN_SUCCESS && hp != MACH_PORT_NULL) { hp_how = "host_get_special_port"; return cached = hp; }
+    }
+  }
+  hp_how = (!p_hpriv && !p_hsp) ? "kedua fungsi (host_get_host_priv_port, host_get_special_port) hilang"
+                                : "kernel menolak (butuh root / host_priv)";
+  return MACH_PORT_NULL;
+}
+
 static void zones(FILE *f) {
-  if (!p_zi || !p_hpriv) { fprintf(f, "zone: mach_zone_info/host_get_host_priv_port tidak ada\n"); return; }
-  mach_port_t hp = MACH_PORT_NULL;
-  if (p_hpriv(mach_host_self(), &hp) != KERN_SUCCESS || hp == MACH_PORT_NULL) { fprintf(f, "zone: host_priv ditolak (butuh root / kernel dev)\n"); return; }
+  if (!p_zi) { fprintf(f, "zone: simbol mach_zone_info HILANG di sistem ini\n"); return; }
+  mach_port_t hp = get_hpriv();
+  if (hp == MACH_PORT_NULL) { fprintf(f, "zone: host_priv tidak didapat: %s\n", hp_how); return; }
   zname_t *nm = NULL; zinfo_t *zi = NULL; mach_msg_type_number_t nn = 0, ni = 0;
   kern_return_t kr = p_zi(hp, &nm, &nn, &zi, &ni);
   if (kr != KERN_SUCCESS || !nm || !zi) { fprintf(f, "zone: mach_zone_info gagal kr=%d\n", kr); return; }
@@ -383,6 +439,103 @@ static void zones(FILE *f) {
   pn = (int)n;
   vm_deallocate(mach_task_self(), (vm_address_t)nm, nn * sizeof(zname_t));
   vm_deallocate(mach_task_self(), (vm_address_t)zi, ni * sizeof(zinfo_t));
+}
+
+/* ---- kmem: memori kernel per "site"/tag via mach_memory_info ----
+ * Tata letak struct berubah antar versi XNU, jadi kita menebak: 176 byte (versi baru, ada name[80])
+ * atau 64 byte (versi lama). Pilihan yang dipakai dicetak supaya bisa dicek. */
+typedef struct { uint64_t flags, site, size, freeb, largest, coll, mapped, peak;
+                 uint16_t tag, zone, ra[2]; uint64_t rv[3]; char name[80]; } kmi176_t;
+typedef struct { uint64_t flags, site, size, freeb, largest, rv[3]; } kmi64_t;
+typedef char kmi_chk176[(sizeof(kmi176_t) == 176) ? 1 : -1];
+typedef char kmi_chk64[(sizeof(kmi64_t) == 64) ? 1 : -1];
+
+static int name_ok(const char *nm) {         /* 80 byte: karakter tercetak lalu NUL */
+  int i = 0;
+  for (; i < 80 && nm[i]; i++) if ((unsigned char)nm[i] < 32 || (unsigned char)nm[i] > 126) return 0;
+  return i < 80;
+}
+
+static void kmem(FILE *f) {
+  if (!p_mmi) { fprintf(f, "kmem: simbol mach_memory_info HILANG di sistem ini\n"); return; }
+  mach_port_t hp = get_hpriv();
+  if (hp == MACH_PORT_NULL) { fprintf(f, "kmem: host_priv tidak didapat: %s\n", hp_how); return; }
+  zname_t *nm = NULL; zinfo_t *zi = NULL; void *mi = NULL;
+  mach_msg_type_number_t nn = 0, ni = 0, nmi = 0;
+  int stride = 64;
+  kern_return_t kr = p_mmi(hp, &nm, &nn, &zi, &ni, &mi, &nmi);
+  if (kr != KERN_SUCCESS || !mi || !nmi) { fprintf(f, "kmem: mach_memory_info gagal kr=%d n=%u\n", kr, (unsigned)nmi); goto out; }
+
+  {
+    unsigned chk = nmi < 8 ? nmi : 8; int good = 0, named = 0;
+    kmi176_t *e = (kmi176_t *)mi;
+    for (unsigned i = 0; i < chk; i++) if (name_ok(e[i].name)) { good++; if (e[i].name[0]) named++; }
+    if (chk && good >= (int)chk - 1 && named >= 1) stride = 176;
+  }
+
+  enum { MAXK = 1024 };
+  static uint64_t fl[MAXK], st[MAXK], sz[MAXK], pk[MAXK];
+  static char nmx[MAXK][48];
+  static uint64_t pf[MAXK], pst[MAXK], psz[MAXK], f0[MAXK];
+  static int pn = 0;
+  int n = nmi > MAXK ? MAXK : (int)nmi;
+  uint64_t tot = 0; int nz = 0;
+  for (int i = 0; i < n; i++) {
+    nmx[i][0] = 0; pk[i] = 0;
+    if (stride == 176) {
+      kmi176_t *e = &((kmi176_t *)mi)[i];
+      fl[i] = e->flags; st[i] = e->site; sz[i] = e->size; pk[i] = e->peak;
+      snprintf(nmx[i], sizeof(nmx[i]), "%.47s", e->name);
+      if (!nmx[i][0]) snprintf(nmx[i], sizeof(nmx[i]), "tag%u", (unsigned)e->tag);
+    } else {
+      kmi64_t *e = &((kmi64_t *)mi)[i];
+      fl[i] = e->flags; st[i] = e->site; sz[i] = e->size;
+      snprintf(nmx[i], sizeof(nmx[i]), "site=0x%llx", (unsigned long long)e->site);
+    }
+    if (sz[i]) { tot += sz[i]; nz++; }
+  }
+  fprintf(f, "kmem: stride=%d entri=%u tak-nol=%d jumlah=%.0fMB host_priv=%s "
+             "(type=flags&0xFF: 0=tag 1=kmod 2=kernel 3=zone 4=counter, dugaan dari vm_kern.h; counter bukan alokasi terpisah)\n",
+          stride, (unsigned)nmi, nz, MB(tot), hp_how);
+
+  double dl[MAXK], d0[MAXK];
+  int same_layout = (pn == n);
+  for (int i = 0; i < n; i++) {
+    int same = same_layout && pf[i] == fl[i] && pst[i] == st[i];
+    dl[i] = same ? (double)sz[i] - (double)psz[i] : 0;
+    d0[i] = same ? (double)sz[i] - (double)f0[i] : 0;
+    if (!same) f0[i] = sz[i];
+    pf[i] = fl[i]; pst[i] = st[i]; psz[i] = sz[i];
+  }
+  pn = n;
+
+  static int ord[MAXK];
+  for (int i = 0; i < n; i++) ord[i] = i;
+  for (int a = 1; a < n; a++) {                       /* insertion sort turun menurut size */
+    int x = ord[a], b = a - 1;
+    while (b >= 0 && sz[ord[b]] < sz[x]) { ord[b + 1] = ord[b]; b--; }
+    ord[b + 1] = x;
+  }
+  for (int k = 0, shown = 0; k < n && shown < 18; k++) {
+    int i = ord[k];
+    if (sz[i] < 4 * 1048576ULL) break;
+    fprintf(f, "kmem:   %-30.30s type=%llu flags=0x%llx size=%.1fMB peak=%.1fMB d=%+.1fMB d0=%+.1fMB\n",
+            nmx[i], (unsigned long long)(fl[i] & 0xFF), (unsigned long long)fl[i], MB(sz[i]), MB(pk[i]),
+            dl[i] / 1048576.0, d0[i] / 1048576.0);
+    shown++;
+  }
+  for (int k = 0; k < 4; k++) {                      /* 4 entri yang paling tumbuh sejak sampel pertama */
+    int bi = -1; double bd = 8 * 1048576.0;
+    for (int i = 0; i < n; i++) if (d0[i] > bd) { bd = d0[i]; bi = i; }
+    if (bi < 0) break;
+    fprintf(f, "kmem: tumbuh: %-30.30s +%.1fMB sejak awal (size=%.1fMB type=%llu)\n",
+            nmx[bi], bd / 1048576.0, MB(sz[bi]), (unsigned long long)(fl[bi] & 0xFF));
+    d0[bi] = 0;
+  }
+out:
+  if (nm) vm_deallocate(mach_task_self(), (vm_address_t)nm, nn * sizeof(zname_t));
+  if (zi) vm_deallocate(mach_task_self(), (vm_address_t)zi, ni * sizeof(zinfo_t));
+  if (mi) vm_deallocate(mach_task_self(), (vm_address_t)mi, nmi * (size_t)stride);
 }
 
 static void memtop(FILE *f, double t, int detail) {
@@ -454,14 +607,24 @@ static void memtop(FILE *f, double t, int detail) {
     if (big >= 0) vmdetail(f, rows[big].pid, rows[big].name);
     if (gi >= 0 && gi != big && gd > 20 * 1048576.0) vmdetail(f, rows[gi].pid, rows[gi].name);
     zones(f);
+    kmem(f);
   }
   free(rows); free(pids);
+}
+
+/* wired (MB) dan free (MB) saat ini; murah, dipanggil tiap detik untuk menangkap lonjakan. */
+static double wired_mb(double *freemb) {
+  vm_size_t ps = 0; host_page_size(mach_host_self(), &ps);
+  vm_statistics64_data_t v; mach_msg_type_number_t c = HOST_VM_INFO64_COUNT;
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&v, &c) != 0) return -1;
+  if (freemb) *freemb = v.free_count * (double)ps / 1048576.0;
+  return v.wire_count * (double)ps / 1048576.0;
 }
 
 /* Every second: if the kernel finished a new SWEET FPS second (kern.sweet_fps), log it.
  * The kernel only updates it while frames come, so an idle screen writes nothing. */
 int main(void) {
-  double t0 = now_s(), tmem = -100, tio = -1000, tmt = -1000, tdet = -1000;
+  double t0 = now_s(), tmem = -100, tio = -1000, tmt = -1000, tdet = -1000, tburst = -1000, lastw = -1;
   int boot_done = 0;
   unsigned last_seq = 0;
   int warned = 0;
@@ -482,11 +645,15 @@ int main(void) {
     int doio = t - t0 >= 20 && t - tio >= 120;
     int domt = t - t0 >= 10 && t - tmt >= 60;          /* memtop tiap 60 dtk, rincian vm+zone tiap 120 dtk */
     int dodet = domt && t - tdet >= 120;
+    /* lonjakan wired: naik >= 40MB (atau turun >= 100MB) sejak catatan terakhir, maks sekali per 10 dtk */
+    double fmb = 0, wmb = wired_mb(&fmb);
+    if (lastw < 0) lastw = wmb;
+    int burst = wmb >= 0 && t - tburst >= 10 && (wmb - lastw >= 40 || lastw - wmb >= 100);
     if (!fresh) {
       FILE *nul = fopen("/dev/null", "w");     /* keep the deltas current without logging */
       if (nul) { cpuload(nul); fclose(nul); }
     }
-    if (fresh || domem || doio || domt || (!have && !warned)) {
+    if (fresh || domem || doio || domt || burst || (!have && !warned)) {
       FILE *f = fopen("/var/mobile/specinfo.txt", "a");
       if (!f) f = fopen("/var/tmp/specinfo.txt", "a");
       if (f) {
@@ -507,7 +674,13 @@ int main(void) {
         if (!boot_done) { bootinfo(f); boot_done = 1; }
         if (domem) { mem(f); tmem = t; }
         if (doio) { iosnap(f, t - t0); tio = t; }
-        if (domt) { memtop(f, t - t0, dodet); tmt = t; if (dodet) tdet = t; }
+        if (burst) {
+          fprintf(f, "wired: t=%.0fs wired=%.0fMB d=%+.0fMB free=%.0fMB  <-- lonjakan, rincian di bawah\n", t - t0, wmb, wmb - lastw, fmb);
+          iosnap(f, t - t0); tio = t;
+          memtop(f, t - t0, 1); tmt = t; tdet = t;
+          lastw = wmb; tburst = t;
+        } else if (domt) { memtop(f, t - t0, dodet); tmt = t; if (dodet) tdet = t; }
+        if (domem && !burst) lastw = wmb;
         fflush(f); fsync(fileno(f)); fclose(f);
       }
     }
