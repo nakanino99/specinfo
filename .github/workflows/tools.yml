@@ -11,22 +11,29 @@ jobs:
           import urllib.request, subprocess, re, os, lzma, gzip
           def fetch(u): return urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Telesphoreo APT-HTTP/1.0.592"})).read()
           BASE="https://apt.procurs.us/"
-          IDX=BASE+"dists/iphoneos-arm64/1700/main/binary-iphoneos-arm/Packages"
           data=None
-          for ext in (".xz",".gz",".zst"):
-              try:
-                  raw=fetch(IDX+ext)
-              except Exception as e:
-                  print("skip",ext,e); continue
-              if ext==".xz": data=lzma.decompress(raw)
-              elif ext==".gz": data=gzip.decompress(raw)
-              else:
-                  open("p.zst","wb").write(raw); subprocess.check_call(["zstd","-df","p.zst","-o","p.txt"]); data=open("p.txt","rb").read()
-              break
+          for suite in ("iphoneos-arm64/1700","1700"):
+              for sub in ("Packages.zst","Packages.xz","Packages.gz","Packages","main/binary-iphoneos-arm/Packages.xz","main/binary-iphoneos-arm/Packages.gz","main/binary-iphoneos-arm/Packages"):
+                  u=BASE+"dists/"+suite+"/"+sub
+                  try:
+                      raw=fetch(u); print("OK",u,len(raw))
+                  except Exception as e:
+                      print("gagal",u,e); continue
+                  if sub.endswith(".zst"):
+                      open("p.zst","wb").write(raw); subprocess.check_call(["zstd","-df","p.zst","-o","p.txt"]); data=open("p.txt","rb").read()
+                  elif sub.endswith(".xz"): data=lzma.decompress(raw)
+                  elif sub.endswith(".gz"): data=gzip.decompress(raw)
+                  else: data=raw
+                  break
+              if data: break
+          if not data:
+              try: print(fetch(BASE+"dists/iphoneos-arm64/1700/InRelease")[:600])
+              except Exception as e: print("InRelease",e)
+              raise SystemExit("indeks tidak ketemu")
           pk={}
           for st in data.decode().split("\n\n"):
               f=dict(re.findall(r"^([A-Za-z-]+): (.*)$",st,re.M))
-              if "Package" in f: pk[f["Package"]]=f
+              if "Package" in f and f.get("Architecture") in ("iphoneos-arm","all"): pk[f["Package"]]=f
           want=["coreutils","grep","sed","findutils","diffutils","tar","gzip","less","nano","gawk","bash"]
           skip={"firmware","dpkg","apt"}
           got=[]
