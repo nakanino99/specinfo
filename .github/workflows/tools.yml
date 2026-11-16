@@ -1,0 +1,54 @@
+name: tools
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Fetch
+        run: |
+          brew install dpkg ldid zstd
+          cat > get.py <<'PY'
+          import urllib.request, subprocess, re, os, lzma, gzip
+          BASE="https://apt.procurs.us/"
+          IDX=BASE+"dists/iphoneos-arm64/1700/main/binary-iphoneos-arm/Packages"
+          data=None
+          for ext in (".xz",".gz",".zst"):
+              try:
+                  raw=urllib.request.urlopen(IDX+ext).read()
+              except Exception as e:
+                  print("skip",ext,e); continue
+              if ext==".xz": data=lzma.decompress(raw)
+              elif ext==".gz": data=gzip.decompress(raw)
+              else:
+                  open("p.zst","wb").write(raw); subprocess.check_call(["zstd","-df","p.zst","-o","p.txt"]); data=open("p.txt","rb").read()
+              break
+          pk={}
+          for st in data.decode().split("\n\n"):
+              f=dict(re.findall(r"^([A-Za-z-]+): (.*)$",st,re.M))
+              if "Package" in f: pk[f["Package"]]=f
+          want=["coreutils","grep","sed","findutils","diffutils","tar","gzip","less","nano","gawk","bash"]
+          skip={"firmware","dpkg","apt"}
+          got=[]
+          def add(n):
+              if n in got or n in skip or n not in pk: return
+              got.append(n)
+              for d in pk[n].get("Depends","").split(","):
+                  d=d.split("|")[0].strip().split("(")[0].strip().split(":")[0]
+                  if d: add(d)
+          for w in want: add(w)
+          print("PAKET:",got)
+          os.makedirs("debs",exist_ok=True)
+          for n in got:
+              u=BASE+pk[n]["Filename"]; fn="debs/"+n+".deb"
+              open(fn,"wb").write(urllib.request.urlopen(u).read())
+              subprocess.check_call(["dpkg-deb","-x",fn,"out"])
+          PY
+          python3 get.py
+          # tanda tangan ulang seperti specinfod (ldid -S)
+          find out -type f | while read f; do file "$f" | grep -q Mach-O && ldid -S "$f"; done
+          tar -C out -czf tools.tar.gz .
+          du -sh tools.tar.gz; ls out out/usr/bin | head -80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tools
+          path: tools.tar.gz
