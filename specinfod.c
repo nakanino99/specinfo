@@ -4,7 +4,10 @@
 #include <time.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <errno.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 
@@ -98,7 +101,7 @@ static void iosnap(FILE *f, double t) {
   CFRefT key = p_MkStr(NULL, "IOUserClientCreator", 0x08000100);
   static const char *svcwords[] = {"accel", "gpu", "adreno", "topaz", "redwood", "agx", "sgx", "metal", "framebuffer", "clcd", "iosurface", NULL};
   char seen[48][200]; int nseen = 0, lines = 0;
-  char tcr[24][96]; int tcn[24]; int ntc = 0;     /* jumlah user client IOSurface per pembuat */
+  char tcr[24][96]; int tcn[24]; int ntc = 0; int norph = 0;     /* jumlah user client IOSurface per pembuat */
   fprintf(f, "io: t=%.0fs\n", t);
   io_obj_t e;
   while ((e = p_Next(it)) != 0) {
@@ -118,6 +121,11 @@ static void iosnap(FILE *f, double t) {
       if (k < ntc) tcn[k]++;
     }
     if (creator[0]) {
+      int cp = 0;                          /* user client yang pembuatnya sudah mati = bocor di kernel */
+      if (sscanf(creator, "pid %d", &cp) == 1 && cp > 1 && kill(cp, 0) != 0 && errno == ESRCH) {
+        norph++;
+        if (norph <= 30) fprintf(f, "io: ORPHAN uc %s <- %s (proses pembuat sudah mati)\n", cls, creator);
+      }
       snprintf(line, sizeof(line), "io: uc %s <- %s", cls, creator);
     } else {
       for (int i = 0; svcwords[i]; i++) {
@@ -136,7 +144,117 @@ static void iosnap(FILE *f, double t) {
   }
   p_Rel(it);
   for (int k = 0; k < ntc; k++) fprintf(f, "io: iosurface-clients %s x%d\n", tcr[k], tcn[k]);
+  fprintf(f, "io: orphan-user-client total=%d (pembuat sudah mati tapi user client masih ada)\n", norph);
   if (key) p_CFRel(key);
+}
+
+
+/* ---- iodiag: hitungan kelas IOKit, alokasi IOMalloc dll lewat IOKitDiagnostics (seperti ioclasscount/ioalloccount) ----
+ * Kalau tag IOKit di kmem naik tapi tidak ada proses yang memegangnya, di sini terlihat KELAS apa yang
+ * jumlah instance-nya naik terus (mis. IOSurface, buffer driver GPU). */
+static long (*p_DCnt)(CFRefT);
+static void (*p_DGK)(CFRefT, const void **, const void **);
+static unsigned char (*p_NGV)(CFRefT, long, void *);
+static unsigned long (*p_DTID)(void);
+static unsigned long (*p_NTID)(void);
+static io_obj_t (*p_FromPath)(unsigned, const char *);
+static int diag_ready = -1;
+
+static int diag_load(void) {
+  if (diag_ready >= 0) return diag_ready;
+  void *k = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+  void *c = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+  if (!k || !c) return diag_ready = 0;
+  *(void **)&p_DCnt = dlsym(c, "CFDictionaryGetCount");
+  *(void **)&p_DGK = dlsym(c, "CFDictionaryGetKeysAndValues");
+  *(void **)&p_NGV = dlsym(c, "CFNumberGetValue");
+  *(void **)&p_DTID = dlsym(c, "CFDictionaryGetTypeID");
+  *(void **)&p_NTID = dlsym(c, "CFNumberGetTypeID");
+  *(void **)&p_FromPath = dlsym(k, "IORegistryEntryFromPath");
+  return diag_ready = (p_DCnt && p_DGK && p_NGV && p_DTID && p_NTID) ? 1 : 0;
+}
+
+#define DSLOTS 3
+#define MAXC 2048
+static struct { char nm[64]; uint64_t first, prev; } dtab[DSLOTS][MAXC];
+static int dnum[DSLOTS], dsamples[DSLOTS];
+
+static void diag_dict(FILE *f, io_obj_t d, const char *prop, int slot, int asbytes, int ngrow, int ntop, double thr) {
+  CFRefT key = p_MkStr(NULL, prop, 0x08000100);
+  CFRefT v = p_Prop(d, key, NULL, 0);
+  p_CFRel(key);
+  if (!v) { fprintf(f, "iokit: properti %s tidak ada\n", prop); return; }
+  if (p_TypeID(v) != p_DTID()) { fprintf(f, "iokit: properti %s bukan dictionary\n", prop); p_CFRel(v); return; }
+  long n = p_DCnt(v);
+  if (n <= 0 || n > 100000) { fprintf(f, "iokit: %s n=%ld (kosong/tidak wajar)\n", prop, n); p_CFRel(v); return; }
+  const void **ks = malloc(n * sizeof(void *)), **vs = malloc(n * sizeof(void *));
+  struct drow { int idx; double val, d0, dl; } *rows = malloc(n * sizeof(struct drow));
+  if (!ks || !vs || !rows) { free(ks); free(vs); free(rows); p_CFRel(v); return; }
+  p_DGK(v, ks, vs);
+  int nr = 0; double total = 0;
+  for (long i = 0; i < n; i++) {
+    if (p_TypeID(ks[i]) != p_StrTypeID() || p_TypeID(vs[i]) != p_NTID()) continue;
+    char buf[128] = {0};
+    if (!p_GetCStr(ks[i], buf, sizeof(buf), 0x08000100)) continue;
+    long long val = 0; p_NGV(vs[i], 4 /*SInt64*/, &val);
+    int k = -1;
+    for (int j = 0; j < dnum[slot]; j++) if (!strncmp(dtab[slot][j].nm, buf, 63)) { k = j; break; }
+    if (k < 0 && dnum[slot] < MAXC) {
+      k = dnum[slot]++;
+      snprintf(dtab[slot][k].nm, 64, "%.63s", buf);
+      dtab[slot][k].first = dtab[slot][k].prev = dsamples[slot] ? 0 : (uint64_t)val;   /* kelas baru muncul belakangan: awal = 0 */
+    }
+    if (k < 0) continue;
+    rows[nr].idx = k; rows[nr].val = (double)val;
+    rows[nr].d0 = (double)val - (double)dtab[slot][k].first;
+    rows[nr].dl = (double)val - (double)dtab[slot][k].prev;
+    dtab[slot][k].prev = (uint64_t)val; total += (double)val; nr++;
+  }
+  dsamples[slot]++;
+  double unit = asbytes ? 1048576.0 : 1.0; const char *u = asbytes ? "MB" : "";
+  fprintf(f, "iokit: %s: %d entri total=%.1f%s\n", prop, nr, total / unit, asbytes ? "MB" : " instance");
+  /* terbesar */
+  char *used = calloc(nr ? nr : 1, 1);
+  for (int k = 0; used && k < ntop && k < nr; k++) {
+    int b = -1;
+    for (int i = 0; i < nr; i++) if (!used[i] && (b < 0 || rows[i].val > rows[b].val)) b = i;
+    if (b < 0) break;
+    used[b] = 1;
+    fprintf(f, "iokit:   %-34.34s %.1f%s d=%+.1f%s d0=%+.1f%s\n", dtab[slot][rows[b].idx].nm, rows[b].val / unit, u,
+            rows[b].dl / unit, u, rows[b].d0 / unit, u);
+  }
+  free(used);
+  /* paling tumbuh sejak sampel pertama */
+  for (int k = 0; k < ngrow; k++) {
+    int b = -1; for (int i = 0; i < nr; i++) if (rows[i].d0 / unit >= thr && rows[i].d0 > 0 && (b < 0 || rows[i].d0 > rows[b].d0)) b = i;
+    if (b < 0) break;
+    fprintf(f, "iokit: tumbuh: %-34.34s %.1f%s (d0=%+.1f%s d=%+.1f%s)\n", dtab[slot][rows[b].idx].nm, rows[b].val / unit, u, rows[b].d0 / unit, u, rows[b].dl / unit, u);
+    rows[b].d0 = 0;
+  }
+  free(ks); free(vs); free(rows); p_CFRel(v);
+}
+
+static void iodiag(FILE *f, double t) {
+  if (!io_load() || !diag_load()) { fprintf(f, "iokit: IOKit/CoreFoundation tidak lengkap untuk IOKitDiagnostics\n"); return; }
+  io_obj_t d = p_FromPath ? p_FromPath(0, "IOService:/IOKitDiagnostics") : 0;
+  if (!d) {                                   /* cadangan: cari lewat iterasi registry */
+    io_obj_t it = 0;
+    if (p_Iter(0, "IOService", 1, &it) == 0 && it) {
+      io_obj_t e;
+      while ((e = p_Next(it)) != 0) {
+        io_name_t cls = {0}; p_Class(e, cls);
+        if (!strcmp(cls, "IOKitDiagnostics")) { d = e; break; }
+        p_Rel(e);
+      }
+      p_Rel(it);
+    }
+  }
+  if (!d) { fprintf(f, "iokit: IOKitDiagnostics tidak ditemukan di registry\n"); return; }
+  fprintf(f, "iokit: t=%.0fs (IOKitDiagnostics: Allocation=byte IOMalloc dll, Classes=jumlah instance per kelas)\n", t);
+  diag_dict(f, d, "Allocation", 0, 1, 0, 8, 0);
+  diag_dict(f, d, "Classes", 1, 0, 15, 6, 10);
+  diag_dict(f, d, "Tags", 2, 1, 10, 10, 1);
+  p_Rel(d);
 }
 
 static void bootinfo(FILE *f) {
@@ -718,10 +836,10 @@ int main(void) {
         if (!have && !warned) { fprintf(f, "kern.sweet_fps belum ada di kernel ini\n"); warned = 1; }
         if (!boot_done) { bootinfo(f); boot_done = 1; }
         if (domem) { mem(f); tmem = t; }
-        if (doio) { iosnap(f, t - t0); tio = t; }
+        if (doio) { iosnap(f, t - t0); iodiag(f, t - t0); tio = t; }
         if (burst) {
           fprintf(f, "wired: t=%.0fs wired=%.0fMB d=%+.0fMB free=%.0fMB  <-- lonjakan, rincian di bawah\n", t - t0, wmb, wmb - lastw, fmb);
-          iosnap(f, t - t0); tio = t;
+          iosnap(f, t - t0); iodiag(f, t - t0); tio = t;
           memtop(f, t - t0, 1); tmt = t; tdet = t;
           lastw = wmb; tburst = t;
         } else if (domt) { memtop(f, t - t0, dodet); tmt = t; if (dodet) tdet = t; }
