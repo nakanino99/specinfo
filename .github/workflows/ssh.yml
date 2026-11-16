@@ -1,0 +1,29 @@
+name: ssh-bin
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Build
+        run: |
+          brew install ldid
+          export CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=14.0"
+          B=$(clang -dumpmachine)
+          curl -fsSL https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.86.tar.bz2 | tar xj
+          cd dropbear-2024.86
+          ./configure --host=aarch64-apple-darwin --build=$B --disable-zlib --disable-syslog --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-pututline --disable-pututxline --enable-bundled-libtom
+          make PROGRAMS="dropbear" -j4
+          cp dropbear ..; cd ..
+          curl -fsSL http://gondor.apana.org.au/~herbert/dash/files/dash-0.5.12.tar.gz | tar xz
+          cd dash-0.5.12
+          ./configure --host=aarch64-apple-darwin --build=$B CC_FOR_BUILD=clang
+          make -j4
+          cp src/dash ..; cd ..
+          ldid -S dropbear; ldid -S dash
+          file dropbear dash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-bin
+          path: |
+            dropbear
+            dash
